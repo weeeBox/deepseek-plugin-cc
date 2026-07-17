@@ -106,21 +106,23 @@ def call_reviewer(prompt, run=subprocess.run):
     if not key:
         raise RuntimeError("DEEPSEEK_API_KEY not set")
     env = dict(os.environ)
-    env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
+    env.pop("ANTHROPIC_API_KEY", None)      # drop any stray Anthropic key so the review
+    env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL   # always authenticates against DeepSeek
     env["ANTHROPIC_AUTH_TOKEN"] = key       # DeepSeek key, per the official integration
     env["ANTHROPIC_MODEL"] = MODEL
-    # Read-only enforcement: --allowedTools only AUTO-APPROVES (so reads run unattended);
-    # --disallowedTools is what actually REMOVES a tool from the model's context. List
-    # every mutation/exfil/spawn tool there so the reviewer genuinely cannot modify the
-    # repo, shell out, or fan out. (Confirmed via Claude Code CLI docs.)
+    # Read-only enforcement: --tools is the hard ALLOWLIST - it removes every other tool
+    # from the model's context (unlike --allowedTools, which only auto-approves). The
+    # reviewer gets Read/Grep/Glob and nothing that can mutate the repo, shell out, or fan
+    # out. (An earlier --disallowedTools list broke on the non-existent "MultiEdit" name.)
     cmd = [CLAUDE_BIN, "-p", prompt, "--model", MODEL,
-           "--allowedTools", "Read,Grep,Glob",
-           "--disallowedTools",
-           "Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task",
+           "--tools", "Read,Grep,Glob",
            "--output-format", "text"]
     r = run(cmd, env=env, capture_output=True, text=True, timeout=REVIEW_TIMEOUT)
     if r.returncode != 0:
-        raise RuntimeError(f"claude exited {r.returncode}: {(r.stderr or '')[:200]}")
+        # surface the TAIL of combined output - the real cause (e.g. "402 Insufficient
+        # Balance") usually lands after the connector warning, not in stderr[:200].
+        detail = ((r.stderr or "") + (r.stdout or "")).strip()
+        raise RuntimeError(f"claude exited {r.returncode}: {detail[-300:]}")
     out = (r.stdout or "").strip()
     if not out:
         raise RuntimeError("empty reviewer output")
@@ -392,12 +394,17 @@ def selftest():
     assert call_reviewer("p", run=fake) == "VERDICT: SHIP"
     assert seen["env"]["ANTHROPIC_BASE_URL"] == ANTHROPIC_BASE_URL
     assert seen["env"]["ANTHROPIC_AUTH_TOKEN"] == "x"
-    assert "Read,Grep,Glob" in seen["cmd"]
-    # read-only is enforced by --disallowedTools (removes tools from context), not by the
-    # absence of names: every mutation/exfil/spawn tool must be in the disallowed list.
-    di = seen["cmd"][seen["cmd"].index("--disallowedTools") + 1]
-    for t in ("Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"):
-        assert t in di, f"{t} not disallowed: {di}"
+    # read-only is enforced by the --tools ALLOWLIST (only Read/Grep/Glob exist to the
+    # model); no mutation tool is granted, and a stray Anthropic key is dropped so the
+    # review always authenticates against DeepSeek.
+    ti = seen["cmd"][seen["cmd"].index("--tools") + 1]
+    assert ti == "Read,Grep,Glob", ti
+    for t in ("Bash", "Write", "Edit", "NotebookEdit"):
+        assert t not in ti
+    os.environ["ANTHROPIC_API_KEY"] = "stray"
+    call_reviewer("p", run=fake)
+    assert "ANTHROPIC_API_KEY" not in seen["env"], "stray Anthropic key must be dropped"
+    os.environ.pop("ANTHROPIC_API_KEY", None)
     try:
         call_reviewer("p", run=lambda *a, **k: R(1, "")); assert False
     except RuntimeError:
