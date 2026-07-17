@@ -82,19 +82,25 @@ The diff under review:
 
 # ---- verdict engine (fail-closed) -----------------------------------------
 
-# Match `VERDICT: <state>` anywhere in a line, tolerant of markdown the model adds around
-# it (`**VERDICT: SHIP**`, `` `VERDICT: BLOCK` ``, `## VERDICT: ...`). SHIP-WITH-CHANGES is
-# listed first so it wins over the SHIP prefix. Real LLM output is formatted, not bare.
-_VERDICT_RE = re.compile(
-    r"VERDICT:\s*(SHIP-WITH-CHANGES|SHIP|BLOCK|OVERSIZE|ERROR)\b", re.IGNORECASE)
+# A verdict LINE begins with `VERDICT:` after optional markdown (`**VERDICT: SHIP**`,
+# `` `VERDICT: BLOCK` ``, `## VERDICT: ...`, `> VERDICT: ...`). Anchoring at line-start is
+# deliberate: an incidental `VERDICT: SHIP` mentioned mid-prose (a quoted example, a test
+# note) is NOT a verdict line and must be ignored - otherwise a real `VERDICT: BLOCK`
+# followed by such prose would false-SHIP, the worst outcome for a blocking gate.
+# SHIP-WITH-CHANGES precedes SHIP; \b rejects partial words (SHIPPED).
+_VERDICT_LINE_RE = re.compile(
+    r"^[\s>*#`_-]*VERDICT:\s*(SHIP-WITH-CHANGES|SHIP|BLOCK|OVERSIZE|ERROR)\b",
+    re.IGNORECASE)
 
 
 def extract_verdict(reply):
-    """Last recognized VERDICT line wins; unknown/absent -> BLOCK (fail-closed)."""
-    verdict = "BLOCK"
-    for m in _VERDICT_RE.finditer(reply):
-        verdict = m.group(1).upper()
-    return verdict
+    """Return the FINAL verdict line's verdict (scan bottom-up), never the last token
+    anywhere in prose. Absent/unknown -> BLOCK (fail-closed)."""
+    for line in reversed(reply.splitlines()):
+        m = _VERDICT_LINE_RE.match(line.strip())
+        if m:
+            return m.group(1).upper()
+    return "BLOCK"
 
 
 def build_diff(base, scope):
@@ -112,22 +118,30 @@ def call_reviewer(prompt, run=subprocess.run):
     if not key:
         raise RuntimeError("DEEPSEEK_API_KEY not set")
     env = dict(os.environ)
-    env.pop("ANTHROPIC_API_KEY", None)      # drop any stray Anthropic key so the review
-    env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL   # always authenticates against DeepSeek
+    # Force routing to DeepSeek: drop a stray Anthropic key AND the provider toggles that
+    # would otherwise send the "DeepSeek" review to Bedrock/Vertex/Anthropic instead.
+    for var in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL"):
+        env.pop(var, None)
+    env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
     env["ANTHROPIC_AUTH_TOKEN"] = key       # DeepSeek key, per the official integration
     env["ANTHROPIC_MODEL"] = MODEL
-    # Read-only enforcement: --tools is the hard ALLOWLIST - it removes every other tool
-    # from the model's context (unlike --allowedTools, which only auto-approves). The
-    # reviewer gets Read/Grep/Glob and nothing that can mutate the repo, shell out, or fan
-    # out. (An earlier --disallowedTools list broke on the non-existent "MultiEdit" name.)
+    # Read-only: --tools is the built-in tool ALLOWLIST (Read/Grep/Glob only - Write/Edit/
+    # Bash are excluded from the model's context), and --strict-mcp-config blocks external
+    # MCP servers so no MCP-provided tool can mutate the repo either. This scopes the
+    # reviewer to the built-in read tools; it does not sandbox the OS beyond that.
     cmd = [CLAUDE_BIN, "-p", prompt, "--model", MODEL,
            "--tools", "Read,Grep,Glob",
+           "--strict-mcp-config",
            "--output-format", "text"]
     r = run(cmd, env=env, capture_output=True, text=True, timeout=REVIEW_TIMEOUT)
     if r.returncode != 0:
         # surface the TAIL of combined output - the real cause (e.g. "402 Insufficient
-        # Balance") usually lands after the connector warning, not in stderr[:200].
+        # Balance") lands after the connector warning - but SCRUB the key first so it is
+        # never relayed into logs (defense-in-depth; it is passed via env, not argv).
         detail = ((r.stderr or "") + (r.stdout or "")).strip()
+        if key:
+            detail = detail.replace(key, "***")
         raise RuntimeError(f"claude exited {r.returncode}: {detail[-300:]}")
     out = (r.stdout or "").strip()
     if not out:
@@ -165,13 +179,15 @@ def _error_note(exc):
     """Turn an exception into a fail-closed ERROR note, with an actionable recommendation
     for the common, recoverable failure modes (chiefly DeepSeek insufficient balance)."""
     msg = str(exc)
-    if re.search(r"\b402\b|insufficient\s+balance", msg, re.IGNORECASE):
+    # Require HTTP/API context around the status code so an internal traceback line
+    # number (e.g. "deepseek_companion.py:402") can't be mistaken for a 402 balance error.
+    if re.search(r"(?:HTTP|API Error:?)\s*402|insufficient\s+balance", msg, re.IGNORECASE):
         return ("DeepSeek API returned HTTP 402 (insufficient balance): the DeepSeek "
                 f"account has no credits, so no review ran. Recommendation: top up at "
                 f"{TOPUP_URL}, then re-run the review. This is a human stop, not a code "
                 "finding - nothing was reviewed.")
-    if re.search(r"\b401\b|unauthor|invalid.*(?:key|token)|authentication",
-                 msg, re.IGNORECASE):
+    if re.search(r"(?:HTTP|API Error:?)\s*401|\bunauthorized\b|authentication\s+failed"
+                 r"|invalid.{0,20}(?:api\s*key|token)", msg, re.IGNORECASE):
         return ("DeepSeek API returned an auth error: DEEPSEEK_API_KEY looks missing or "
                 "invalid. Recommendation: run /deepseek:setup, confirm the key is a valid "
                 "DeepSeek Platform key, then re-run.")
@@ -360,26 +376,31 @@ def cmd_cancel(args):
 
 def cmd_setup(args):
     key = bool(os.environ.get("DEEPSEEK_API_KEY"))
-    claude_ok = False
-    try:
-        claude_ok = subprocess.run([CLAUDE_BIN, "--version"], capture_output=True,
-                                    timeout=10).returncode == 0
+    claude_ok = tools_ok = False
+    try:  # check --help: it proves the CLI runs AND that it supports the --tools flag the
+        h = subprocess.run([CLAUDE_BIN, "--help"], capture_output=True, text=True,
+                           timeout=15)  # reviewer relies on (an older CLI lacks it)
+        claude_ok = h.returncode == 0
+        tools_ok = "--tools" in (h.stdout or "")
     except Exception:
-        claude_ok = False
-    ready = key and claude_ok
+        claude_ok = tools_ok = False
+    ready = key and claude_ok and tools_ok
     status = {"ready": ready, "deepseek_api_key": key, "claude_cli": claude_ok,
-              "model": MODEL, "endpoint": ANTHROPIC_BASE_URL}
+              "claude_tools_flag": tools_ok, "model": MODEL, "endpoint": ANTHROPIC_BASE_URL}
     if "--json" in args:
         print(json.dumps(status))
     else:
         print(f"DeepSeek gate ready: {ready}")
         print(f"  DEEPSEEK_API_KEY set: {key}")
         print(f"  claude CLI available: {claude_ok}")
+        print(f"  claude supports --tools: {tools_ok}")
         print(f"  model: {MODEL}  endpoint: {ANTHROPIC_BASE_URL}")
         if not key:
             print("  -> add DEEPSEEK_API_KEY to your environment (or repo .env).")
         if not claude_ok:
             print("  -> install Claude Code CLI (`claude`) and ensure it is on PATH.")
+        elif not tools_ok:
+            print("  -> your claude CLI is too old (no --tools flag); upgrade Claude Code.")
     return 0 if ready else 1
 
 
@@ -396,7 +417,19 @@ def selftest():
                         ("## VERDICT: SHIP-WITH-CHANGES", "SHIP-WITH-CHANGES"),
                         ("**VERDICT: SHIP-WITH-CHANGES**", "SHIP-WITH-CHANGES"),
                         ("findings\n**VERDICT: SHIP**\ntrailing note", "SHIP"),
-                        ("VERDICT: SHIPPED soon", "BLOCK")]:  # \b guards partial words
+                        ("VERDICT: SHIPPED soon", "BLOCK"),  # \b guards partial words
+                        # CRITICAL: a real BLOCK line followed by prose that QUOTES a
+                        # verdict must stay BLOCK - the anchored final-line scan ignores
+                        # the mid-prose mention (was a false-SHIP with last-match-anywhere).
+                        ("finding: parser scans prose.\n\nVERDICT: BLOCK\n\n"
+                         "note: a later `VERDICT: SHIP` example is ignored.", "BLOCK"),
+                        # a verdict only MENTIONED in prose (no verdict line) -> BLOCK
+                        ("the reviewer should emit VERDICT: SHIP on its own line", "BLOCK"),
+                        # a genuine final verdict line still wins over an earlier one
+                        ("VERDICT: BLOCK\ntext\nVERDICT: SHIP", "SHIP"),
+                        # trailing text on the verdict line is fine (anchored at start)
+                        ("VERDICT: SHIP (all clear)", "SHIP"),
+                        ("> VERDICT: BLOCK", "BLOCK")]:  # blockquoted verdict line
         got = extract_verdict(reply)
         assert got == want, f"{reply!r} -> {got!r} want {want!r}"
     # canonical trailing verdict even after a raw model VERDICT line
@@ -431,14 +464,28 @@ def selftest():
     assert ti == "Read,Grep,Glob", ti
     for t in ("Bash", "Write", "Edit", "NotebookEdit"):
         assert t not in ti
+    assert "--strict-mcp-config" in seen["cmd"], "MCP tools must be blocked"
+    # provider toggles + stray Anthropic key are dropped so the review can only route to
+    # DeepSeek (never Bedrock/Vertex/Anthropic).
     os.environ["ANTHROPIC_API_KEY"] = "stray"
+    os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
     call_reviewer("p", run=fake)
-    assert "ANTHROPIC_API_KEY" not in seen["env"], "stray Anthropic key must be dropped"
+    for v in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK"):
+        assert v not in seen["env"], f"{v} must be dropped"
     os.environ.pop("ANTHROPIC_API_KEY", None)
+    os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)
     try:
         call_reviewer("p", run=lambda *a, **k: R(1, "")); assert False
     except RuntimeError:
         pass
+    # the error path SCRUBS the key from surfaced output (no token in logs)
+    os.environ["DEEPSEEK_API_KEY"] = "sk-secret-xyz"
+    try:
+        call_reviewer("p", run=lambda *a, **k: R(1, "boom near sk-secret-xyz end"))
+        assert False
+    except RuntimeError as e:
+        assert "sk-secret-xyz" not in str(e) and "***" in str(e), str(e)
+    os.environ["DEEPSEEK_API_KEY"] = "x"
     # focus parsing: non-flag leftovers become focus text (3-tuple, no background/wait)
     b, sc, fx = _parse_common(["--base", "main", "check", "the", "locks"])
     assert b == "main" and fx == "check the locks", (b, fx)
@@ -462,6 +509,10 @@ def selftest():
     assert TOPUP_URL in bal and "top up" in bal.lower() and "402" in bal, bal
     assert _error_note(RuntimeError("boom")) == "RuntimeError: boom"
     assert "setup" in _error_note(RuntimeError("401 unauthorized")).lower()
+    # a bare traceback line number must NOT be mistaken for an HTTP 402/401 status
+    assert "top up" not in _error_note(RuntimeError("bug at file.py:402 in foo")).lower()
+    assert _error_note(RuntimeError("crash at parser.py:401")) == \
+        "RuntimeError: crash at parser.py:401"
     print("selftest OK")
 
 
