@@ -60,9 +60,11 @@ look BEYOND the diff:
 registered, wired, or called - a shipped no-op. Grep for call sites of what the diff adds.
 2. concurrency-path routing: a new lock/queue/idempotency layer one caller still bypasses.
 
-Tie every finding to file:line. Do NOT modify any file. End your reply with the verdict on \
-its own final line as bare text with NO markdown (no **bold**, no backticks): exactly \
-'VERDICT: SHIP' or 'VERDICT: SHIP-WITH-CHANGES' or 'VERDICT: BLOCK'. BLOCK if any finding \
+Tie every finding to file:line. Do NOT modify any file. Your reply's FINAL line MUST be \
+your verdict in this EXACT machine format and nothing else on that line: \
+'DEEPSEEK_GATE_VERDICT: SHIP' or 'DEEPSEEK_GATE_VERDICT: SHIP-WITH-CHANGES' or \
+'DEEPSEEK_GATE_VERDICT: BLOCK'. Use the token DEEPSEEK_GATE_VERDICT ONLY on that one final \
+verdict line - NEVER inside a finding, quote, code block, or example. BLOCK if any finding \
 could ship a bug.
 
 The diff under review:
@@ -82,14 +84,15 @@ The diff under review:
 
 # ---- verdict engine (fail-closed) -----------------------------------------
 
-# A verdict LINE begins with `VERDICT:` after optional markdown (`**VERDICT: SHIP**`,
-# `` `VERDICT: BLOCK` ``, `## VERDICT: ...`, `> VERDICT: ...`). Anchoring at line-start is
-# deliberate: an incidental `VERDICT: SHIP` mentioned mid-prose (a quoted example, a test
-# note) is NOT a verdict line and must be ignored - otherwise a real `VERDICT: BLOCK`
-# followed by such prose would false-SHIP, the worst outcome for a blocking gate.
-# SHIP-WITH-CHANGES precedes SHIP; \b rejects partial words (SHIPPED).
+# The verdict is carried by a DISTINCTIVE sentinel token, `DEEPSEEK_GATE_VERDICT:`, that
+# the reviewer is told to emit ONLY on its final verdict line and never in prose/examples.
+# This is what makes extraction robust: an incidental `VERDICT: SHIP` a reviewer writes in
+# a bullet, a quoted example, or a list continuation does NOT carry the sentinel, so it can
+# never override the real verdict (the round-1..6 false-SHIP class). Anchored at line-start
+# after optional markdown; SHIP-WITH-CHANGES precedes SHIP; \b rejects partial words.
 _VERDICT_LINE_RE = re.compile(
-    r"^[\s>*#`_-]*VERDICT:\s*(SHIP-WITH-CHANGES|SHIP|BLOCK|OVERSIZE|ERROR)\b",
+    r"^[\s>*#`_-]*DEEPSEEK_GATE_VERDICT:\s*"
+    r"(SHIP-WITH-CHANGES|SHIP|BLOCK|OVERSIZE|ERROR)\b",
     re.IGNORECASE)
 
 
@@ -434,53 +437,34 @@ def cmd_setup(args):
 # ---- selftest -------------------------------------------------------------
 
 def selftest():
-    for reply, want in [("VERDICT: SHIP", "SHIP"), ("x\nVERDICT: BLOCK", "BLOCK"),
-                        ("VERDICT: ship", "SHIP"), ("VERDICT: SHIP\nVERDICT: BLOCK", "BLOCK"),
-                        ("none", "BLOCK"), ("VERDICT: MAYBE", "BLOCK"),
-                        ("VERDICT: SHIP-WITH-CHANGES", "SHIP-WITH-CHANGES"),
-                        # markdown the model actually emits (the live-caught bug):
-                        ("**VERDICT: SHIP**", "SHIP"),
-                        ("`VERDICT: BLOCK`", "BLOCK"),
-                        ("## VERDICT: SHIP-WITH-CHANGES", "SHIP-WITH-CHANGES"),
-                        ("**VERDICT: SHIP-WITH-CHANGES**", "SHIP-WITH-CHANGES"),
-                        ("findings\n**VERDICT: SHIP**\ntrailing note", "SHIP"),
-                        ("VERDICT: SHIPPED soon", "BLOCK"),  # \b guards partial words
-                        # CRITICAL: a real BLOCK line followed by prose that QUOTES a
-                        # verdict must stay BLOCK - the anchored final-line scan ignores
-                        # the mid-prose mention (was a false-SHIP with last-match-anywhere).
-                        ("finding: parser scans prose.\n\nVERDICT: BLOCK\n\n"
-                         "note: a later `VERDICT: SHIP` example is ignored.", "BLOCK"),
-                        # a verdict only MENTIONED in prose (no verdict line) -> BLOCK
-                        ("the reviewer should emit VERDICT: SHIP on its own line", "BLOCK"),
-                        # a genuine final verdict line still wins over an earlier one
-                        ("VERDICT: BLOCK\ntext\nVERDICT: SHIP", "SHIP"),
-                        # trailing text on the verdict line is fine (anchored at start)
-                        ("VERDICT: SHIP (all clear)", "SHIP"),
-                        ("> VERDICT: BLOCK", "BLOCK"),  # blockquoted verdict line
-                        # CRITICAL: a VERDICT inside a ``` code fence (a quoted example /
-                        # regression-test snippet) must NOT override the real verdict.
-                        ("Real bug.\n\nVERDICT: BLOCK\n\nRegression test to add:\n"
-                         "```text\nVERDICT: SHIP\n```", "BLOCK"),
-                        ("VERDICT: SHIP\n```\nexample: VERDICT: BLOCK\n```", "SHIP"),
-                        # a verdict seen ONLY inside a fence -> fail-closed BLOCK
-                        ("```\nVERDICT: SHIP\n```", "BLOCK"),
-                        # NESTED fences: inner ``` inside outer ```` is content, so the
-                        # fenced SHIP is skipped and the real BLOCK stands (round-3 residual)
-                        ("VERDICT: BLOCK\n````text\n```\nVERDICT: SHIP\n```\n````", "BLOCK"),
-                        # different-char nesting (``` inside ~~~)
-                        ("VERDICT: BLOCK\n~~~\n```\nVERDICT: SHIP\n```\n~~~", "BLOCK"),
-                        # 4-space indented code block example (round-4 residual)
-                        ("Real bug.\n\nVERDICT: BLOCK\n\nExample:\n    VERDICT: SHIP",
-                         "BLOCK"),
-                        ("\tVERDICT: SHIP", "BLOCK"),          # tab-indented example
-                        ("    VERDICT: SHIP", "BLOCK"),        # indent-only -> fail-closed
-                        ("  VERDICT: SHIP", "SHIP"),           # <4 spaces is still a verdict
-                        # a same-length run WITH an info string (```python) is NOT a close
-                        # (CommonMark: a closing fence is bare) -> stays inside the fence, so
-                        # the example SHIP is skipped and the real BLOCK stands (round-5).
-                        ("VERDICT: BLOCK\n```\ntext\n```python\nVERDICT: SHIP\n```", "BLOCK"),
-                        # a bare same-length run DOES close, so a following real verdict counts
-                        ("```\nexample\n```\nVERDICT: SHIP", "SHIP")]:
+    S = "DEEPSEEK_GATE_VERDICT:"  # the sentinel; only the reviewer's real verdict uses it
+    for reply, want in [
+            (f"{S} SHIP", "SHIP"), (f"x\n{S} BLOCK", "BLOCK"),
+            (f"{S.lower()} ship", "SHIP"),                 # case-insensitive
+            (f"{S} SHIP\n{S} BLOCK", "BLOCK"),             # last sentinel wins
+            ("no verdict here", "BLOCK"),                  # no sentinel -> fail-closed
+            (f"{S} MAYBE", "BLOCK"),                       # unknown state -> fail-closed
+            (f"{S} SHIP-WITH-CHANGES", "SHIP-WITH-CHANGES"),
+            (f"**{S} SHIP**", "SHIP"), (f"`{S} BLOCK`", "BLOCK"),   # markdown wrap
+            (f"{S} SHIPPED soon", "BLOCK"),                # \b guards partial words
+            # THE POINT: a bare "VERDICT: X" WITHOUT the sentinel never passes, so a
+            # verdict-looking string in prose / a bullet / a list continuation is inert.
+            ("VERDICT: SHIP", "BLOCK"),
+            ("findings\nVERDICT: SHIP\nmore", "BLOCK"),
+            (f"{S} BLOCK\n\nRegression: `VERDICT: SHIP` should be ignored.", "BLOCK"),
+            (f"{S} BLOCK\n1. Example:\n   VERDICT: SHIP", "BLOCK"),
+            ("- VERDICT: SHIP should be ignored", "BLOCK"),
+            # a genuine later sentinel wins; trailing text on the line is fine
+            (f"{S} BLOCK\ntext\n{S} SHIP", "SHIP"),
+            (f"{S} SHIP (all clear)", "SHIP"),
+            # meta-case (reviewing THIS repo): a fenced / indented / nested sentinel
+            # EXAMPLE is skipped by the fence+indent logic, so the real verdict stands.
+            (f"{S} BLOCK\n```\n{S} SHIP\n```", "BLOCK"),
+            (f"{S} BLOCK\n````\n```\n{S} SHIP\n```\n````", "BLOCK"),
+            (f"{S} BLOCK\nExample:\n    {S} SHIP", "BLOCK"),
+            (f"\t{S} SHIP", "BLOCK"),
+            (f"{S} BLOCK\n```\ntext\n```python\n{S} SHIP\n```", "BLOCK"),
+            (f"```\nex\n```\n{S} SHIP", "SHIP")]:
         got = extract_verdict(reply)
         assert got == want, f"{reply!r} -> {got!r} want {want!r}"
     # canonical trailing verdict even after a raw model VERDICT line
