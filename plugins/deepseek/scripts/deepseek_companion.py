@@ -94,13 +94,23 @@ _VERDICT_LINE_RE = re.compile(
 
 
 def extract_verdict(reply):
-    """Return the FINAL verdict line's verdict (scan bottom-up), never the last token
-    anywhere in prose. Absent/unknown -> BLOCK (fail-closed)."""
-    for line in reversed(reply.splitlines()):
-        m = _VERDICT_LINE_RE.match(line.strip())
+    """Return the last verdict LINE that is OUTSIDE any code fence. Fenced ``` / ~~~ blocks
+    are skipped so a quoted example verdict (e.g. a regression-test snippet showing
+    `VERDICT: SHIP`) can never override the reviewer's real verdict. Absent/unknown, or a
+    verdict only ever seen inside a fence -> BLOCK (fail-closed)."""
+    verdict = "BLOCK"
+    in_fence = False
+    for line in reply.splitlines():
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _VERDICT_LINE_RE.match(s)
         if m:
-            return m.group(1).upper()
-    return "BLOCK"
+            verdict = m.group(1).upper()  # last verdict OUTSIDE fences wins
+    return verdict
 
 
 def build_diff(base, scope):
@@ -118,11 +128,13 @@ def call_reviewer(prompt, run=subprocess.run):
     if not key:
         raise RuntimeError("DEEPSEEK_API_KEY not set")
     env = dict(os.environ)
-    # Force routing to DeepSeek: drop a stray Anthropic key AND the provider toggles that
-    # would otherwise send the "DeepSeek" review to Bedrock/Vertex/Anthropic instead.
-    for var in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-                "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL"):
-        env.pop(var, None)
+    # Force routing to DeepSeek: strip EVERY inherited Anthropic var and provider toggle by
+    # PATTERN (not a fixed name list - the CLI keeps adding CLAUDE_CODE_USE_* providers like
+    # Bedrock/Vertex/Foundry/Gateway/Mantle), then set exactly the three DeepSeek ones. This
+    # is comprehensive and future-proof: no stray provider env can re-route the review.
+    for k in list(env):
+        if k.startswith("ANTHROPIC_") or k.startswith("CLAUDE_CODE_USE_"):
+            env.pop(k, None)
     env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
     env["ANTHROPIC_AUTH_TOKEN"] = key       # DeepSeek key, per the official integration
     env["ANTHROPIC_MODEL"] = MODEL
@@ -429,7 +441,14 @@ def selftest():
                         ("VERDICT: BLOCK\ntext\nVERDICT: SHIP", "SHIP"),
                         # trailing text on the verdict line is fine (anchored at start)
                         ("VERDICT: SHIP (all clear)", "SHIP"),
-                        ("> VERDICT: BLOCK", "BLOCK")]:  # blockquoted verdict line
+                        ("> VERDICT: BLOCK", "BLOCK"),  # blockquoted verdict line
+                        # CRITICAL: a VERDICT inside a ``` code fence (a quoted example /
+                        # regression-test snippet) must NOT override the real verdict.
+                        ("Real bug.\n\nVERDICT: BLOCK\n\nRegression test to add:\n"
+                         "```text\nVERDICT: SHIP\n```", "BLOCK"),
+                        ("VERDICT: SHIP\n```\nexample: VERDICT: BLOCK\n```", "SHIP"),
+                        # a verdict seen ONLY inside a fence -> fail-closed BLOCK
+                        ("```\nVERDICT: SHIP\n```", "BLOCK")]:
         got = extract_verdict(reply)
         assert got == want, f"{reply!r} -> {got!r} want {want!r}"
     # canonical trailing verdict even after a raw model VERDICT line
@@ -465,15 +484,19 @@ def selftest():
     for t in ("Bash", "Write", "Edit", "NotebookEdit"):
         assert t not in ti
     assert "--strict-mcp-config" in seen["cmd"], "MCP tools must be blocked"
-    # provider toggles + stray Anthropic key are dropped so the review can only route to
-    # DeepSeek (never Bedrock/Vertex/Anthropic).
-    os.environ["ANTHROPIC_API_KEY"] = "stray"
-    os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+    # EVERY ANTHROPIC_* / CLAUDE_CODE_USE_* var is stripped by pattern (not a fixed list),
+    # so no provider toggle can re-route the review; the three DeepSeek vars are then set.
+    strays = {"ANTHROPIC_API_KEY": "k", "CLAUDE_CODE_USE_BEDROCK": "1",
+              "CLAUDE_CODE_USE_FOUNDRY": "1", "CLAUDE_CODE_USE_GATEWAY": "1",
+              "ANTHROPIC_VERTEX_BASE_URL": "http://x"}
+    os.environ.update(strays)
     call_reviewer("p", run=fake)
-    for v in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK"):
+    for v in strays:
         assert v not in seen["env"], f"{v} must be dropped"
-    os.environ.pop("ANTHROPIC_API_KEY", None)
-    os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)
+    assert seen["env"]["ANTHROPIC_BASE_URL"] == ANTHROPIC_BASE_URL
+    assert seen["env"]["ANTHROPIC_AUTH_TOKEN"] == "x"
+    for v in strays:
+        os.environ.pop(v, None)
     try:
         call_reviewer("p", run=lambda *a, **k: R(1, "")); assert False
     except RuntimeError:
