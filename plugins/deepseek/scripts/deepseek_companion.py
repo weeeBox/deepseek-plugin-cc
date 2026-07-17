@@ -103,6 +103,11 @@ def extract_verdict(reply):
     verdict = "BLOCK"
     fence = None  # (char, length) of the open fence, or None when outside
     for line in reply.splitlines():
+        # A line indented >= 4 spaces (or by a tab) is a Markdown indented code block:
+        # content, never a real (unindented) verdict line - so an indented example verdict
+        # cannot override the reviewer's real one. (Fence delimiters allow 0-3 lead spaces.)
+        if line[:1] == "\t" or (len(line) - len(line.lstrip(" "))) >= 4:
+            continue
         s = line.strip()
         fchar = "`" if s.startswith("```") else ("~" if s.startswith("~~~") else None)
         if fchar:
@@ -461,7 +466,13 @@ def selftest():
                         # fenced SHIP is skipped and the real BLOCK stands (round-3 residual)
                         ("VERDICT: BLOCK\n````text\n```\nVERDICT: SHIP\n```\n````", "BLOCK"),
                         # different-char nesting (``` inside ~~~)
-                        ("VERDICT: BLOCK\n~~~\n```\nVERDICT: SHIP\n```\n~~~", "BLOCK")]:
+                        ("VERDICT: BLOCK\n~~~\n```\nVERDICT: SHIP\n```\n~~~", "BLOCK"),
+                        # 4-space indented code block example (round-4 residual)
+                        ("Real bug.\n\nVERDICT: BLOCK\n\nExample:\n    VERDICT: SHIP",
+                         "BLOCK"),
+                        ("\tVERDICT: SHIP", "BLOCK"),          # tab-indented example
+                        ("    VERDICT: SHIP", "BLOCK"),        # indent-only -> fail-closed
+                        ("  VERDICT: SHIP", "SHIP")]:          # <4 spaces is still a verdict
         got = extract_verdict(reply)
         assert got == want, f"{reply!r} -> {got!r} want {want!r}"
     # canonical trailing verdict even after a raw model VERDICT line
