@@ -176,6 +176,26 @@ def _state_dir():
     return d
 
 
+def _try_state_dir():
+    """_state_dir() but returns None instead of raising — job tracking must never crash
+    a review (e.g. an unwritable ~/.deepseek-plugin-cc)."""
+    try:
+        return _state_dir()
+    except Exception:
+        return None
+
+
+def _safe_write_job(sd, job):
+    """Best-effort job record; swallow all IO errors. The gate result is the stdout
+    VERDICT line + exit code, not the job file, so a failed write must not crash."""
+    if not sd:
+        return
+    try:
+        _write_job(sd, job)
+    except Exception:
+        pass
+
+
 def _job_path(sd, jid):
     return os.path.join(sd, "jobs", f"{jid}.json")
 
@@ -227,20 +247,23 @@ def cmd_review(args, adversarial):
     """Always synchronous: records a 'running' job BEFORE the (slow) review so an
     immediate /deepseek:status sees it, then updates it to 'done'. Backgrounding is
     Claude Code's run_in_background on the command, not an internal fork."""
-    sd = _state_dir()
-    jid = _new_jid()
     try:
         base, scope, focus = _parse_common(args)
     except ValueError as e:  # malformed gate input -> fail closed, never a pass
         print(f"({e})\nVERDICT: ERROR" if adversarial else f"(error: {e})")
         return 1
+    # Job tracking is best-effort and runs OUTSIDE the verdict path: it must never crash
+    # the review. _try_state_dir/_safe_write_job swallow FS errors; do_review is itself
+    # fail-closed, so the canonical VERDICT line always prints even if job IO fails.
+    sd = _try_state_dir()
+    jid = _new_jid()
     job = {"id": jid, "kind": "adversarial-review" if adversarial else "review",
            "status": "running", "pid": os.getpid(), "base": base, "scope": scope,
            "verdict": None, "started": int(time.time())}
-    _write_job(sd, job)  # exists immediately, before the review runs
+    _safe_write_job(sd, job)  # exists immediately, before the review runs
     verdict, text = do_review(base, scope, adversarial, focus)
     job.update(status="done", verdict=verdict, output=text)
-    _write_job(sd, job)
+    _safe_write_job(sd, job)
     print(text)
     return 0 if (not adversarial or verdict == "SHIP") else 1
 
@@ -393,6 +416,10 @@ def selftest():
     assert _normalize(["--base main check locks"]) == ["--base", "main", "check", "locks"]
     assert _normalize(["--base", "main"]) == ["--base", "main"]
     assert _normalize(['a "b']) == ['a "b']
+    # job tracking is best-effort: a None or unwritable state dir must NOT raise, so it
+    # can never crash the (fail-closed) verdict path.
+    _safe_write_job(None, {"id": "x"})
+    _safe_write_job("/nonexistent-root-dir/nope", {"id": "x", "status": "running"})
     print("selftest OK")
 
 

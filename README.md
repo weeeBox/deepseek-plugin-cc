@@ -36,8 +36,8 @@ repo's `.env`. Requires the `claude` CLI on PATH.
 
 | Command | Purpose |
 |---------|---------|
-| `/deepseek:adversarial-review [--wait\|--background] [--base <ref>] [focus]` | Ship/no-ship gate — returns a `VERDICT` line. |
-| `/deepseek:review [--wait\|--background] [--base <ref>] [--scope ...]` | Plain read-only review (no verdict). |
+| `/deepseek:adversarial-review [--base <ref>] [--scope ...] [focus]` | Ship/no-ship gate — returns a `VERDICT` line. |
+| `/deepseek:review [--base <ref>] [--scope ...]` | Plain read-only review (no verdict). |
 | `/deepseek:setup` | Check `DEEPSEEK_API_KEY` + `claude` CLI readiness. |
 | `/deepseek:status [--json]` | List jobs and their status. |
 | `/deepseek:result <jobId>` | Show a finished job's output/verdict. |
