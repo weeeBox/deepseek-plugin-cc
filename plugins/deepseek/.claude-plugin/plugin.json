@@ -1,6 +1,6 @@
 {
   "name": "deepseek",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Use DeepSeek from Claude Code to review code (ship/no-ship gate) or delegate a review.",
   "author": {
     "name": "user"

@@ -25,6 +25,7 @@ with no `claude` call and no API spend.
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -58,9 +59,10 @@ look BEYOND the diff:
 registered, wired, or called - a shipped no-op. Grep for call sites of what the diff adds.
 2. concurrency-path routing: a new lock/queue/idempotency layer one caller still bypasses.
 
-Tie every finding to file:line. Do NOT modify any file. End your reply with exactly one \
-line: 'VERDICT: SHIP' or 'VERDICT: SHIP-WITH-CHANGES' or 'VERDICT: BLOCK'. BLOCK if any \
-finding could ship a bug.
+Tie every finding to file:line. Do NOT modify any file. End your reply with the verdict on \
+its own final line as bare text with NO markdown (no **bold**, no backticks): exactly \
+'VERDICT: SHIP' or 'VERDICT: SHIP-WITH-CHANGES' or 'VERDICT: BLOCK'. BLOCK if any finding \
+could ship a bug.
 
 The diff under review:
 
@@ -79,15 +81,18 @@ The diff under review:
 
 # ---- verdict engine (fail-closed) -----------------------------------------
 
+# Match `VERDICT: <state>` anywhere in a line, tolerant of markdown the model adds around
+# it (`**VERDICT: SHIP**`, `` `VERDICT: BLOCK` ``, `## VERDICT: ...`). SHIP-WITH-CHANGES is
+# listed first so it wins over the SHIP prefix. Real LLM output is formatted, not bare.
+_VERDICT_RE = re.compile(
+    r"VERDICT:\s*(SHIP-WITH-CHANGES|SHIP|BLOCK|OVERSIZE|ERROR)\b", re.IGNORECASE)
+
+
 def extract_verdict(reply):
-    """Last recognized VERDICT: line wins; unknown/absent -> BLOCK (fail-closed)."""
+    """Last recognized VERDICT line wins; unknown/absent -> BLOCK (fail-closed)."""
     verdict = "BLOCK"
-    for line in reply.splitlines():
-        s = line.strip()
-        if s.upper().startswith("VERDICT:"):
-            cand = s.split(":", 1)[1].strip().upper()
-            if cand in VALID:
-                verdict = cand
+    for m in _VERDICT_RE.finditer(reply):
+        verdict = m.group(1).upper()
     return verdict
 
 
@@ -366,7 +371,14 @@ def selftest():
     for reply, want in [("VERDICT: SHIP", "SHIP"), ("x\nVERDICT: BLOCK", "BLOCK"),
                         ("VERDICT: ship", "SHIP"), ("VERDICT: SHIP\nVERDICT: BLOCK", "BLOCK"),
                         ("none", "BLOCK"), ("VERDICT: MAYBE", "BLOCK"),
-                        ("VERDICT: SHIP-WITH-CHANGES", "SHIP-WITH-CHANGES")]:
+                        ("VERDICT: SHIP-WITH-CHANGES", "SHIP-WITH-CHANGES"),
+                        # markdown the model actually emits (the live-caught bug):
+                        ("**VERDICT: SHIP**", "SHIP"),
+                        ("`VERDICT: BLOCK`", "BLOCK"),
+                        ("## VERDICT: SHIP-WITH-CHANGES", "SHIP-WITH-CHANGES"),
+                        ("**VERDICT: SHIP-WITH-CHANGES**", "SHIP-WITH-CHANGES"),
+                        ("findings\n**VERDICT: SHIP**\ntrailing note", "SHIP"),
+                        ("VERDICT: SHIPPED soon", "BLOCK")]:  # \b guards partial words
         got = extract_verdict(reply)
         assert got == want, f"{reply!r} -> {got!r} want {want!r}"
     # canonical trailing verdict even after a raw model VERDICT line
