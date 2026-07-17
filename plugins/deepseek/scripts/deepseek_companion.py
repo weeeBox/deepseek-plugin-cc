@@ -112,11 +112,13 @@ def extract_verdict(reply):
         fchar = "`" if s.startswith("```") else ("~" if s.startswith("~~~") else None)
         if fchar:
             run = len(s) - len(s.lstrip(fchar))
+            rest = s[run:].strip()                         # text after the fence marker
             if fence is None:
-                fence = (fchar, run)                       # open a fence
-            elif fence[0] == fchar and run >= fence[1]:
-                fence = None                               # matching close
-            # a shorter or different-char delimiter while open == fence content: ignore
+                fence = (fchar, run)                       # open a fence (info string ok)
+            elif fence[0] == fchar and run >= fence[1] and rest == "":
+                fence = None                               # valid CLOSE: bare, same char, >=
+            # anything else while a fence is open (shorter run, different char, OR a same-
+            # length run with a trailing info string like ```python) is fence CONTENT: ignore
             continue
         if fence is not None:                              # inside a fence -> skip
             continue
@@ -472,7 +474,13 @@ def selftest():
                          "BLOCK"),
                         ("\tVERDICT: SHIP", "BLOCK"),          # tab-indented example
                         ("    VERDICT: SHIP", "BLOCK"),        # indent-only -> fail-closed
-                        ("  VERDICT: SHIP", "SHIP")]:          # <4 spaces is still a verdict
+                        ("  VERDICT: SHIP", "SHIP"),           # <4 spaces is still a verdict
+                        # a same-length run WITH an info string (```python) is NOT a close
+                        # (CommonMark: a closing fence is bare) -> stays inside the fence, so
+                        # the example SHIP is skipped and the real BLOCK stands (round-5).
+                        ("VERDICT: BLOCK\n```\ntext\n```python\nVERDICT: SHIP\n```", "BLOCK"),
+                        # a bare same-length run DOES close, so a following real verdict counts
+                        ("```\nexample\n```\nVERDICT: SHIP", "SHIP")]:
         got = extract_verdict(reply)
         assert got == want, f"{reply!r} -> {got!r} want {want!r}"
     # canonical trailing verdict even after a raw model VERDICT line
