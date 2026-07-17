@@ -34,6 +34,7 @@ import time
 
 ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
 CLAUDE_BIN = os.environ.get("DEEPSEEK_GATE_CLAUDE_BIN", "claude")
+TOPUP_URL = "https://platform.deepseek.com/top_up"
 
 
 def _int_env(name, default):
@@ -153,11 +154,28 @@ def do_review(base, scope, adversarial, focus=""):
         prompt = tmpl.format(scope=scope_txt, diff=diff, focus=fx)
         reply = call_reviewer(prompt)
     except Exception as e:  # broad catch is deliberate — a blocking gate never errors open
-        return _final(out, "ERROR", f"{type(e).__name__}: {e}", adversarial)
+        return _final(out, "ERROR", _error_note(e), adversarial)
     out.append(reply.rstrip())
     if not adversarial:
         return None, "\n".join(out)
     return _final(out, extract_verdict(reply), None, True)
+
+
+def _error_note(exc):
+    """Turn an exception into a fail-closed ERROR note, with an actionable recommendation
+    for the common, recoverable failure modes (chiefly DeepSeek insufficient balance)."""
+    msg = str(exc)
+    if re.search(r"\b402\b|insufficient\s+balance", msg, re.IGNORECASE):
+        return ("DeepSeek API returned HTTP 402 (insufficient balance): the DeepSeek "
+                f"account has no credits, so no review ran. Recommendation: top up at "
+                f"{TOPUP_URL}, then re-run the review. This is a human stop, not a code "
+                "finding - nothing was reviewed.")
+    if re.search(r"\b401\b|unauthor|invalid.*(?:key|token)|authentication",
+                 msg, re.IGNORECASE):
+        return ("DeepSeek API returned an auth error: DEEPSEEK_API_KEY looks missing or "
+                "invalid. Recommendation: run /deepseek:setup, confirm the key is a valid "
+                "DeepSeek Platform key, then re-run.")
+    return f"{type(exc).__name__}: {msg}"
 
 
 def _final(out, verdict, note, adversarial):
@@ -439,6 +457,11 @@ def selftest():
     # can never crash the (fail-closed) verdict path.
     _safe_write_job(None, {"id": "x"})
     _safe_write_job("/nonexistent-root-dir/nope", {"id": "x", "status": "running"})
+    # actionable ERROR notes: an insufficient-balance failure recommends the top-up link
+    bal = _error_note(RuntimeError("claude exited 1: API Error: 402 Insufficient Balance"))
+    assert TOPUP_URL in bal and "top up" in bal.lower() and "402" in bal, bal
+    assert _error_note(RuntimeError("boom")) == "RuntimeError: boom"
+    assert "setup" in _error_note(RuntimeError("401 unauthorized")).lower()
     print("selftest OK")
 
 
