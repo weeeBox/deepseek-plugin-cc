@@ -94,22 +94,30 @@ _VERDICT_LINE_RE = re.compile(
 
 
 def extract_verdict(reply):
-    """Return the last verdict LINE that is OUTSIDE any code fence. Fenced ``` / ~~~ blocks
-    are skipped so a quoted example verdict (e.g. a regression-test snippet showing
-    `VERDICT: SHIP`) can never override the reviewer's real verdict. Absent/unknown, or a
-    verdict only ever seen inside a fence -> BLOCK (fail-closed)."""
+    """Return the last verdict LINE that is OUTSIDE any code fence, so a quoted example
+    verdict (a regression-test snippet showing `VERDICT: SHIP`) can never override the
+    reviewer's real verdict. Fences are tracked by delimiter char AND length per CommonMark
+    (a fence closes only on a same-char run >= the opener), so NESTED fences (``` inside an
+    outer ````) are handled - the shorter inner delimiter is fence content, not a close.
+    Absent/unknown, or a verdict only ever seen inside a fence -> BLOCK (fail-closed)."""
     verdict = "BLOCK"
-    in_fence = False
+    fence = None  # (char, length) of the open fence, or None when outside
     for line in reply.splitlines():
         s = line.strip()
-        if s.startswith("```") or s.startswith("~~~"):
-            in_fence = not in_fence
+        fchar = "`" if s.startswith("```") else ("~" if s.startswith("~~~") else None)
+        if fchar:
+            run = len(s) - len(s.lstrip(fchar))
+            if fence is None:
+                fence = (fchar, run)                       # open a fence
+            elif fence[0] == fchar and run >= fence[1]:
+                fence = None                               # matching close
+            # a shorter or different-char delimiter while open == fence content: ignore
             continue
-        if in_fence:
+        if fence is not None:                              # inside a fence -> skip
             continue
         m = _VERDICT_LINE_RE.match(s)
         if m:
-            verdict = m.group(1).upper()  # last verdict OUTSIDE fences wins
+            verdict = m.group(1).upper()                   # last verdict OUTSIDE fences wins
     return verdict
 
 
@@ -448,7 +456,12 @@ def selftest():
                          "```text\nVERDICT: SHIP\n```", "BLOCK"),
                         ("VERDICT: SHIP\n```\nexample: VERDICT: BLOCK\n```", "SHIP"),
                         # a verdict seen ONLY inside a fence -> fail-closed BLOCK
-                        ("```\nVERDICT: SHIP\n```", "BLOCK")]:
+                        ("```\nVERDICT: SHIP\n```", "BLOCK"),
+                        # NESTED fences: inner ``` inside outer ```` is content, so the
+                        # fenced SHIP is skipped and the real BLOCK stands (round-3 residual)
+                        ("VERDICT: BLOCK\n````text\n```\nVERDICT: SHIP\n```\n````", "BLOCK"),
+                        # different-char nesting (``` inside ~~~)
+                        ("VERDICT: BLOCK\n~~~\n```\nVERDICT: SHIP\n```\n~~~", "BLOCK")]:
         got = extract_verdict(reply)
         assert got == want, f"{reply!r} -> {got!r} want {want!r}"
     # canonical trailing verdict even after a raw model VERDICT line
