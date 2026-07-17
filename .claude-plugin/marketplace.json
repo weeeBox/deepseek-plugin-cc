@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "DeepSeek plugins for Claude Code: agentic code review and delegation.",
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "plugins": [
     {
       "name": "deepseek",
       "description": "Use DeepSeek from Claude Code to review code (ship/no-ship gate) or delegate a review.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "user"
       },
